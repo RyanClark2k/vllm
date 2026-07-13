@@ -13,9 +13,10 @@ This test enumerates the mixed-precision kernel registry, runs post-load
 twice on a minimal checkpoint-format layer with the production copy-back
 semantics in between, and asserts that every tensor reachable from the layer
 and the kernel object keeps its storage. New kernels are covered by default:
-on GPU they run against real ops; on CPU they run if their post-load path is
-pure torch (e.g. CPUWNA16), or via a small stub adapter for device-only ops
-(Marlin and Machete below), and skip otherwise.
+on GPU they run against real device ops (stub adapters are bypassed); on CPU
+they run if their post-load path is pure torch (e.g. CPUWNA16), or via a
+small stub adapter for device-only ops (Marlin and Machete below), and skip
+otherwise.
 
 The pointer walk unwraps ``functools.partial`` and closure cells: tensors
 smuggled into callables (e.g. Machete's ``act_perm``) are baked into CUDA
@@ -43,6 +44,10 @@ from vllm.model_executor.parameter import (
 from vllm.scalar_type import scalar_types
 
 SIZE_K, SIZE_N, GROUP_SIZE = 128, 64, 64
+
+# On CUDA machines kernels run against real device ops (no stubs); on CPU the
+# stub adapters below make Marlin and Machete runnable.
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _collect_tensors(value, path: str, out: dict[str, int], depth: int) -> None:
@@ -100,7 +105,7 @@ def load_checkpoint_format_weights(layer: torch.nn.Module, has_g_idx: bool, seed
     layer.qweight = PackedvLLMParameter(
         data=torch.randint(
             -(2**31), 2**31 - 1, (SIZE_K // 8, SIZE_N), dtype=torch.int32, generator=gen
-        ),
+        ).to(DEVICE),
         input_dim=0,
         output_dim=1,
         packed_dim=0,
@@ -108,7 +113,9 @@ def load_checkpoint_format_weights(layer: torch.nn.Module, has_g_idx: bool, seed
         weight_loader=default_weight_loader,
     )
     layer.scales = GroupQuantScaleParameter(
-        data=torch.ones(SIZE_K // GROUP_SIZE, SIZE_N, dtype=torch.float16),
+        data=torch.ones(
+            SIZE_K // GROUP_SIZE, SIZE_N, dtype=torch.float16, device=DEVICE
+        ),
         input_dim=0,
         output_dim=1,
         weight_loader=default_weight_loader,
@@ -117,7 +124,7 @@ def load_checkpoint_format_weights(layer: torch.nn.Module, has_g_idx: bool, seed
         layer.g_idx = RowvLLMParameter(
             data=torch.randint(
                 0, SIZE_K // GROUP_SIZE, (SIZE_K,), dtype=torch.int32, generator=gen
-            ),
+            ).to(DEVICE),
             input_dim=0,
             weight_loader=default_weight_loader,
         )
@@ -173,7 +180,7 @@ def test_post_load_runtime_tensors_stable(
     kernel_cls, has_g_idx, monkeypatch, dist_init
 ):
     config = make_config(has_g_idx)
-    adapter = STUB_ADAPTERS.get(kernel_cls.__name__)
+    adapter = None if DEVICE.type == "cuda" else STUB_ADAPTERS.get(kernel_cls.__name__)
 
     if adapter is not None:
         for module, attr, replacement in adapter():
@@ -193,6 +200,11 @@ def test_post_load_runtime_tensors_stable(
         )
 
     layer = torch.nn.Module()
+    layer.input_size = SIZE_K
+    layer.output_size = SIZE_N
+    layer.output_partition_sizes = [SIZE_N]
+    layer.params_dtype = torch.float16
+    layer.has_bias = False
 
     def process(seed: int):
         load_checkpoint_format_weights(layer, has_g_idx, seed)
