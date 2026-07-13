@@ -8,6 +8,7 @@ replay) needs a GPU. The red tests restore the historical rebinding behavior
 that #48438 fixed and assert the manifest reports it at the reload boundary.
 """
 
+import pytest
 import torch
 
 from tests.model_executor.model_loader.test_post_load_storage_stability import (
@@ -110,12 +111,18 @@ def test_manifest_red_on_historical_marlin_behavior(monkeypatch, dist_init):
     assert any("g_idx_sort_indices" in path for path in report.expired + report.moved)
 
 
-def test_manifest_reports_unfixed_machete_act_perm(monkeypatch, dist_init):
-    """Machete's act-order path captures a fresh argsort permutation in
-    ``self.act_perm`` (a ``functools.partial``) on every post-load call;
-    unfixed as of this prototype, reported on RFC #48312. The manifest must
-    report it. When Machete is fixed, this test starts failing and should be
-    inverted to assert ``report.ok``."""
+@pytest.mark.xfail(
+    reason="MacheteLinearKernel rebinds the argsort permutation captured in "
+    "self.act_perm on every post-load call (RFC #48312); the manifest "
+    "correctly reports it. Remove this marker when Machete is fixed.",
+    strict=True,
+)
+def test_machete_act_perm_storage_stable(monkeypatch, dist_init):
+    """Desired invariant: Machete's post-load preserves the storage of every
+    tensor a captured graph could reference, including the permutation held
+    inside the ``act_perm`` partial. Known-unfixed today, so this is a strict
+    xfail: it errors on the day a fix lands, forcing the marker's removal, and
+    then guards the fix."""
     for module, attr, replacement in _machete_stubs():
         monkeypatch.setattr(module, attr, replacement)
     kernel = object.__new__(MacheteLinearKernel)
@@ -130,8 +137,7 @@ def test_manifest_reports_unfixed_machete_act_perm(monkeypatch, dist_init):
     _reload_cycle(kernel, layer, manifest)
     report = manifest.check(layer, kernel)
 
-    assert not report.ok
-    assert any("act_perm" in path for path in report.expired + report.moved)
+    assert report.ok, f"expired={report.expired} moved={report.moved}"
 
 
 def test_manifest_red_on_toy_rebinder(dist_init):
