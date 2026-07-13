@@ -11,9 +11,13 @@ that #48438 fixed and assert the manifest reports it at the reload boundary.
 import torch
 
 from tests.model_executor.model_loader.test_post_load_storage_stability import (
+    _machete_stubs,
     _marlin_stubs,
     load_checkpoint_format_weights,
     make_config,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.machete import (
+    MacheteLinearKernel,
 )
 from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
     MarlinLinearKernel,
@@ -104,6 +108,30 @@ def test_manifest_red_on_historical_marlin_behavior(monkeypatch, dist_init):
     assert not report.ok
     assert any("workspace" in path for path in report.expired + report.moved)
     assert any("g_idx_sort_indices" in path for path in report.expired + report.moved)
+
+
+def test_manifest_reports_unfixed_machete_act_perm(monkeypatch, dist_init):
+    """Machete's act-order path captures a fresh argsort permutation in
+    ``self.act_perm`` (a ``functools.partial``) on every post-load call;
+    unfixed as of this prototype, reported on RFC #48312. The manifest must
+    report it. When Machete is fixed, this test starts failing and should be
+    inverted to assert ``report.ok``."""
+    for module, attr, replacement in _machete_stubs():
+        monkeypatch.setattr(module, attr, replacement)
+    kernel = object.__new__(MacheteLinearKernel)
+    kernel.config = make_config(has_g_idx=True)
+    kernel.w_q_name = "qweight"
+    kernel.w_s_name = "scales"
+    kernel.w_zp_name = None
+    kernel.w_gidx_name = "g_idx"
+    layer = torch.nn.Module()
+
+    manifest = ReloadStorageManifest()
+    _reload_cycle(kernel, layer, manifest)
+    report = manifest.check(layer, kernel)
+
+    assert not report.ok
+    assert any("act_perm" in path for path in report.expired + report.moved)
 
 
 def test_manifest_red_on_toy_rebinder(dist_init):
